@@ -1,40 +1,34 @@
 /* ============================================================
- *  main.c — d-grape-test-motors
- *  Замкнутый контур PID: TIM2 PWM + TIM3/TIM4 Encoder + PID
+ *  main.c — d-grape-test-motors (BTS7960B, без энкодеров)
  *
  *  Управление через USB CDC:
- *    w / s      — +0.1 / -0.1 м/с оба мотора
+ *    w / s      — +0.1 / -0.1 скважность оба мотора
  *    a / d      — поворот влево / вправо
  *    пробел     — стоп
- *    left V right V   — задать скорости в м/с (Enter)
+ *    left V right V   — задать скважность [-1.0 .. 1.0] (Enter)
  *    stop             — стоп (Enter)
  *    pid kp V         — изменить Kp (Enter)
  *    pid ki V         — изменить Ki (Enter)
  *    pid kd V         — изменить Kd (Enter)
  *
- *  Вывод 5 Гц: L_set, L_meas, R_set, R_meas, pid_out_L, pid_out_R
+ *  Вывод 5 Гц: L_tgt  L_duty  R_tgt  R_duty
  * ============================================================ */
 
 #include "main.h"
 #include "usb_device.h"
 #include "usbd_cdc_if.h"
 #include "motors.h"
-#include "encoders.h"
 #include "pid.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 
-/* ── HAL handles ────────────────────────────────────────────*/
+/* ── HAL handle ─────────────────────────────────────────────*/
 TIM_HandleTypeDef htim2;
-TIM_HandleTypeDef htim3;
-TIM_HandleTypeDef htim4;
 
-/* ── Аппаратные объекты (инициализируются в main до запуска) ─*/
-static Encoder_t enc_left;
-static Encoder_t enc_right;
-static Motor_t   motor_left;
-static Motor_t   motor_right;
+/* ── Объекты моторов ────────────────────────────────────────*/
+static Motor_t motor_left;
+static Motor_t motor_right;
 
 /* ── RX ring buffer (заполняется из ISR через cdc_rx_hook) ──*/
 #define RX_RING 256U
@@ -53,9 +47,9 @@ void cdc_rx_hook(uint8_t *buf, uint32_t len)
     }
 }
 
-/* ── Команды скорости (защита PRIMASK — float не атомарен) ──*/
-#define STEP_MPS  0.1f
-#define MAX_MPS   1.5f
+/* ── Команды скважности ─────────────────────────────────────*/
+#define STEP_DUTY  0.1f
+#define MAX_DUTY   1.0f
 
 static float    s_cmd_left    = 0.0f;
 static float    s_cmd_right   = 0.0f;
@@ -63,10 +57,10 @@ static uint32_t s_last_cmd_ms = 0U;
 
 static void set_cmd(float l, float r)
 {
-    if (l >  MAX_MPS) l =  MAX_MPS;
-    if (l < -MAX_MPS) l = -MAX_MPS;
-    if (r >  MAX_MPS) r =  MAX_MPS;
-    if (r < -MAX_MPS) r = -MAX_MPS;
+    if (l >  MAX_DUTY) l =  MAX_DUTY;
+    if (l < -MAX_DUTY) l = -MAX_DUTY;
+    if (r >  MAX_DUTY) r =  MAX_DUTY;
+    if (r < -MAX_DUTY) r = -MAX_DUTY;
     uint32_t pri = __get_PRIMASK();
     __disable_irq();
     s_cmd_left    = l;
@@ -86,7 +80,7 @@ static void cdc_send(const char *s, uint16_t len)
     }
 }
 
-/* ── Консоль: обработка одного символа (WASD) ───────────────*/
+/* ── Консоль: WASD ──────────────────────────────────────────*/
 static void handle_key(char c)
 {
     uint32_t pri = __get_PRIMASK();
@@ -96,11 +90,11 @@ static void handle_key(char c)
     __set_PRIMASK(pri);
 
     switch (c) {
-    case 'w': case 'W': l += STEP_MPS; r += STEP_MPS; break;
-    case 's': case 'S': l -= STEP_MPS; r -= STEP_MPS; break;
-    case 'a': case 'A': l -= STEP_MPS; r += STEP_MPS; break;
-    case 'd': case 'D': l += STEP_MPS; r -= STEP_MPS; break;
-    case ' ':           l = 0.0f;      r = 0.0f;      break;
+    case 'w': case 'W': l += STEP_DUTY; r += STEP_DUTY; break;
+    case 's': case 'S': l -= STEP_DUTY; r -= STEP_DUTY; break;
+    case 'a': case 'A': l -= STEP_DUTY; r += STEP_DUTY; break;
+    case 'd': case 'D': l += STEP_DUTY; r -= STEP_DUTY; break;
+    case ' ':           l = 0.0f;       r = 0.0f;       break;
     default: return;
     }
     set_cmd(l, r);
@@ -111,11 +105,10 @@ static void handle_key(char c)
     if (n > 0) cdc_send(resp, (uint16_t)n);
 }
 
-/* ── Консоль: обработка строки (текстовая команда) ──────────*/
+/* ── Консоль: текстовые команды ─────────────────────────────*/
 static void handle_line(const char *line)
 {
-    float vl = 0.0f, vr = 0.0f;
-    float v  = 0.0f;
+    float vl = 0.0f, vr = 0.0f, v = 0.0f;
 
     if (strcmp(line, "stop") == 0) {
         set_cmd(0.0f, 0.0f);
@@ -144,10 +137,10 @@ static void handle_line(const char *line)
     } else if (strcmp(line, "help") == 0) {
         const char *h =
             "Команды:\r\n"
-            "  w/s/a/d/space   — WASD управление\r\n"
-            "  left V right V  — задать скорости [м/с]\r\n"
-            "  stop            — остановить\r\n"
-            "  pid kp/ki/kd V  — настройка PID\r\n";
+            "  w/s/a/d/space    — WASD управление\r\n"
+            "  left V right V   — задать скважность [-1.0..1.0]\r\n"
+            "  stop             — остановить\r\n"
+            "  pid kp/ki/kd V   — настройка PID\r\n";
         cdc_send(h, (uint16_t)strlen(h));
     }
 }
@@ -171,7 +164,6 @@ static void process_console(void)
         } else if (s_line_len == 0U &&
                    (c=='w' || c=='W' || c=='s' || c=='S' ||
                     c=='a' || c=='A' || c=='d' || c=='D' || c==' ')) {
-            /* Одиночная клавиша WASD — обрабатываем сразу */
             handle_key(c);
         } else {
             if (s_line_len < (uint8_t)(sizeof(s_line) - 1U)) {
@@ -185,8 +177,6 @@ static void process_console(void)
 static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
-static void MX_TIM3_Init(void);
-static void MX_TIM4_Init(void);
 
 void Error_Handler(void)
 {
@@ -200,43 +190,42 @@ int main(void)
     HAL_Init();
     SystemClock_Config();
     MX_GPIO_Init();
-    MX_TIM2_Init();   /* PWM */
-    MX_TIM3_Init();   /* Encoder левый */
-    MX_TIM4_Init();   /* Encoder правый */
+    MX_TIM2_Init();
 
-    /* ── Инициализация объектов (runtime, не static init) ───*/
-    enc_left.htim  = &htim3;
-    enc_right.htim = &htim4;
+    /* ── Инициализация левого мотора ────────────────────────*/
+    motor_left.htim      = &htim2;
+    motor_left.ch_fwd    = MOTOR_LEFT_CH_FWD;
+    motor_left.ch_rev    = MOTOR_LEFT_CH_REV;
+    motor_left.ccr_fwd   = &MOTOR_LEFT_CCR_FWD;
+    motor_left.ccr_rev   = &MOTOR_LEFT_CCR_REV;
+    motor_left.arr       = &TIM2->ARR;
+    motor_left.en_port   = MOTOR_LEFT_EN_PORT;
+    motor_left.en_r_pin  = MOTOR_LEFT_EN_R_PIN;
+    motor_left.en_l_pin  = MOTOR_LEFT_EN_L_PIN;
 
-    motor_left.htim     = &htim2;
-    motor_left.channel  = TIM_CHANNEL_1;
-    motor_left.ccr      = &TIM2->CCR1;
-    motor_left.arr      = &TIM2->ARR;
-    motor_left.dir_port = MOTOR_LEFT_DIR_PORT;
-    motor_left.dir_pin  = MOTOR_LEFT_DIR_PIN;
-
+    /* ── Инициализация правого мотора ───────────────────────*/
     motor_right.htim     = &htim2;
-    motor_right.channel  = TIM_CHANNEL_2;
-    motor_right.ccr      = &TIM2->CCR2;
+    motor_right.ch_fwd   = MOTOR_RIGHT_CH_FWD;
+    motor_right.ch_rev   = MOTOR_RIGHT_CH_REV;
+    motor_right.ccr_fwd  = &MOTOR_RIGHT_CCR_FWD;
+    motor_right.ccr_rev  = &MOTOR_RIGHT_CCR_REV;
     motor_right.arr      = &TIM2->ARR;
-    motor_right.dir_port = MOTOR_RIGHT_DIR_PORT;
-    motor_right.dir_pin  = MOTOR_RIGHT_DIR_PIN;
+    motor_right.en_port  = MOTOR_RIGHT_EN_PORT;
+    motor_right.en_r_pin = MOTOR_RIGHT_EN_R_PIN;
+    motor_right.en_l_pin = MOTOR_RIGHT_EN_L_PIN;
 
-    encoder_init(&enc_left);
-    encoder_init(&enc_right);
-    motor_init(&motor_left,  &enc_left,  0.01f);
-    motor_init(&motor_right, &enc_right, 0.01f);
-    pid_enable(&motor_left.pid);
-    pid_enable(&motor_right.pid);
+    motor_init(&motor_left,  0.01f);
+    motor_init(&motor_right, 0.01f);
 
     MX_USB_DEVICE_Init();
     HAL_Delay(500U);
 
     const char *banner =
-        "\r\n=== d-grape-test-motors: замкнутый PID контур ===\r\n"
+        "\r\n=== d-grape-test-motors: BTS7960B, PID плавности ===\r\n"
         "WASD / 'left V right V' / 'stop' / 'help'\r\n"
-        "L_set  L_meas  R_set  R_meas  outL   outR\r\n"
-        "--------------------------------------------\r\n";
+        "Скважность [-1.0 .. 1.0], шаг 0.1\r\n"
+        "L_tgt   L_duty  R_tgt   R_duty\r\n"
+        "-------------------------------------\r\n";
     cdc_send(banner, (uint16_t)strlen(banner));
 
     uint32_t last_pid   = HAL_GetTick() - 10U;
@@ -245,15 +234,11 @@ int main(void)
     for (;;) {
         uint32_t now = HAL_GetTick();
 
-        /* ── 100 Гц: обновление энкодеров и PID ─────────────*/
+        /* ── 100 Гц: PID обновление моторов ─────────────────*/
         if (now - last_pid >= 10U) {
             float dt = (float)(now - last_pid) / 1000.0f;
             last_pid = now;
 
-            encoder_update(&enc_left,  dt);
-            encoder_update(&enc_right, dt);
-
-            /* Читаем команды с защитой */
             float cmd_l, cmd_r;
             uint32_t pri = __get_PRIMASK();
             __disable_irq();
@@ -265,25 +250,25 @@ int main(void)
             /* Safety timeout 500 мс */
             if (age > CMD_TIMEOUT_MS) { cmd_l = 0.0f; cmd_r = 0.0f; }
 
-            motor_velocity_update(&motor_left,  cmd_l, dt);
-            motor_velocity_update(&motor_right, cmd_r, dt);
+            motor_set_target(&motor_left,  cmd_l);
+            motor_set_target(&motor_right, cmd_r);
+            motor_update(&motor_left,  dt);
+            motor_update(&motor_right, dt);
 
-            HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_14); /* красный heartbeat */
+            HAL_GPIO_TogglePin(LED_HEARTBEAT_PORT, LED_HEARTBEAT_PIN);
         }
 
-        /* ── Console input (неблокирующий) ──────────────────*/
+        /* ── Console input ───────────────────────────────────*/
         process_console();
 
         /* ── 5 Гц: вывод состояния ───────────────────────────*/
         if (now - last_print >= 200U) {
             last_print = now;
-            char buf[128];
+            char buf[80];
             int n = snprintf(buf, sizeof(buf),
-                "%6.3f  %6.3f  %6.3f  %6.3f  %6.3f  %6.3f\r\n",
-                (double)s_cmd_left,        (double)enc_left.speed_mps,
-                (double)s_cmd_right,       (double)enc_right.speed_mps,
-                (double)motor_left.pid.output,
-                (double)motor_right.pid.output);
+                "%7.3f  %7.3f  %7.3f  %7.3f\r\n",
+                (double)s_cmd_left,         (double)motor_left.duty_now,
+                (double)s_cmd_right,        (double)motor_right.duty_now);
             if (n > 0) cdc_send(buf, (uint16_t)n);
         }
     }
@@ -314,7 +299,7 @@ static void SystemClock_Config(void)
     HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5);
 }
 
-/* ── GPIO: LED PD12..15 + PE1 + DIR PD0/PD1 ────────────────*/
+/* ── GPIO: LED PD12-15 + PE1 + EN PD0-PD3 ──────────────────*/
 static void MX_GPIO_Init(void)
 {
     __HAL_RCC_GPIOD_CLK_ENABLE();
@@ -325,24 +310,34 @@ static void MX_GPIO_Init(void)
     gpio.Pull  = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
 
-    /* DIR пины + LED */
-    gpio.Pin = MOTOR_LEFT_DIR_PIN | MOTOR_RIGHT_DIR_PIN |
+    /* EN-пины + LED на GPIOD */
+    gpio.Pin = MOTOR_LEFT_EN_R_PIN  | MOTOR_LEFT_EN_L_PIN  |
+               MOTOR_RIGHT_EN_R_PIN | MOTOR_RIGHT_EN_L_PIN |
                GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
     HAL_GPIO_Init(GPIOD, &gpio);
+
+    /* LED error на GPIOE */
     gpio.Pin = GPIO_PIN_1;
     HAL_GPIO_Init(GPIOE, &gpio);
 
+    /* Все LOW; EN будут выставлены HIGH в motor_init */
     HAL_GPIO_WritePin(GPIOD,
-        MOTOR_LEFT_DIR_PIN | MOTOR_RIGHT_DIR_PIN |
+        MOTOR_LEFT_EN_R_PIN  | MOTOR_LEFT_EN_L_PIN  |
+        MOTOR_RIGHT_EN_R_PIN | MOTOR_RIGHT_EN_L_PIN |
         GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
         GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET);
 }
 
-/* ── TIM2: PWM моторы, PA15/PB3, AF1, 20 кГц ───────────────
+/* ── TIM2: PWM 20 кГц, 4 канала ────────────────────────────
  *  APB1 TIM clock = 84 МГц
  *  PSC=0, ARR=4199 → 84 000 000 / 4200 = 20 000 Гц
- * ────────────────────────────────────────────────────────── */
+ *
+ *  CH1 PA15 AF1 — L RPWM (вперёд)
+ *  CH2 PB3  AF1 — R RPWM (вперёд)
+ *  CH3 PB10 AF1 — L LPWM (назад)
+ *  CH4 PB11 AF1 — R LPWM (назад)
+ * ─────────────────────────────────────────────────────────── */
 static void MX_TIM2_Init(void)
 {
     __HAL_RCC_TIM2_CLK_ENABLE();
@@ -354,9 +349,13 @@ static void MX_TIM2_Init(void)
     gpio.Pull      = GPIO_NOPULL;
     gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
     gpio.Alternate = GPIO_AF1_TIM2;
-    gpio.Pin       = GPIO_PIN_15;
+
+    /* PA15 — CH1 */
+    gpio.Pin = GPIO_PIN_15;
     HAL_GPIO_Init(GPIOA, &gpio);
-    gpio.Pin       = GPIO_PIN_3;
+
+    /* PB3 — CH2, PB10 — CH3, PB11 — CH4 */
+    gpio.Pin = GPIO_PIN_3 | GPIO_PIN_10 | GPIO_PIN_11;
     HAL_GPIO_Init(GPIOB, &gpio);
 
     htim2.Instance           = TIM2;
@@ -373,68 +372,6 @@ static void MX_TIM2_Init(void)
     oc.OCFastMode = TIM_OCFAST_DISABLE;
     HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_1);
     HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_2);
-}
-
-/* ── TIM3: Encoder левый, PA6/PA7, AF2 ─────────────────────*/
-static void MX_TIM3_Init(void)
-{
-    __HAL_RCC_TIM3_CLK_ENABLE();
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
-    gpio.Mode      = GPIO_MODE_AF_PP;
-    gpio.Pull      = GPIO_PULLUP;
-    gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
-    gpio.Alternate = GPIO_AF2_TIM3;
-    HAL_GPIO_Init(GPIOA, &gpio);
-
-    htim3.Instance           = TIM3;
-    htim3.Init.Prescaler     = 0;
-    htim3.Init.CounterMode   = TIM_COUNTERMODE_UP;
-    htim3.Init.Period        = ENCODER_TIMER_PERIOD;
-    htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    HAL_TIM_Encoder_Init(&htim3, &(TIM_Encoder_InitTypeDef){
-        .EncoderMode  = TIM_ENCODERMODE_TI12,
-        .IC1Polarity  = TIM_ICPOLARITY_RISING,
-        .IC1Selection = TIM_ICSELECTION_DIRECTTI,
-        .IC1Prescaler = TIM_ICPSC_DIV1,
-        .IC1Filter    = 4,
-        .IC2Polarity  = TIM_ICPOLARITY_RISING,
-        .IC2Selection = TIM_ICSELECTION_DIRECTTI,
-        .IC2Prescaler = TIM_ICPSC_DIV1,
-        .IC2Filter    = 4,
-    });
-}
-
-/* ── TIM4: Encoder правый, PB6/PB7, AF2 ────────────────────*/
-static void MX_TIM4_Init(void)
-{
-    __HAL_RCC_TIM4_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-
-    GPIO_InitTypeDef gpio = {0};
-    gpio.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
-    gpio.Mode      = GPIO_MODE_AF_PP;
-    gpio.Pull      = GPIO_PULLUP;
-    gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
-    gpio.Alternate = GPIO_AF2_TIM4;
-    HAL_GPIO_Init(GPIOB, &gpio);
-
-    htim4.Instance           = TIM4;
-    htim4.Init.Prescaler     = 0;
-    htim4.Init.CounterMode   = TIM_COUNTERMODE_UP;
-    htim4.Init.Period        = ENCODER_TIMER_PERIOD;
-    htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    HAL_TIM_Encoder_Init(&htim4, &(TIM_Encoder_InitTypeDef){
-        .EncoderMode  = TIM_ENCODERMODE_TI12,
-        .IC1Polarity  = TIM_ICPOLARITY_RISING,
-        .IC1Selection = TIM_ICSELECTION_DIRECTTI,
-        .IC1Prescaler = TIM_ICPSC_DIV1,
-        .IC1Filter    = 4,
-        .IC2Polarity  = TIM_ICPOLARITY_RISING,
-        .IC2Selection = TIM_ICSELECTION_DIRECTTI,
-        .IC2Prescaler = TIM_ICPSC_DIV1,
-        .IC2Filter    = 4,
-    });
+    HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_3);
+    HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_4);
 }

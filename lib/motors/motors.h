@@ -2,21 +2,24 @@
 
 #include "stm32f4xx_hal.h"
 #include "pid.h"
-#include "encoders.h"
 #include <stdint.h>
 
 typedef struct {
     TIM_HandleTypeDef *htim;
-    uint32_t           channel;
-    volatile uint32_t *ccr;
-    volatile uint32_t *arr;
-    GPIO_TypeDef      *dir_port;
-    uint16_t           dir_pin;
-    PID_t              pid;
-    Encoder_t         *enc;
+    uint32_t           ch_fwd;       /* RPWM — канал «вперёд» */
+    uint32_t           ch_rev;       /* LPWM — канал «назад»  */
+    volatile uint32_t *ccr_fwd;      /* CCR для RPWM          */
+    volatile uint32_t *ccr_rev;      /* CCR для LPWM          */
+    volatile uint32_t *arr;          /* ARR (период таймера)  */
+    GPIO_TypeDef      *en_port;      /* порт EN-пинов         */
+    uint16_t           en_r_pin;     /* R_EN пин              */
+    uint16_t           en_l_pin;     /* L_EN пин              */
+    float              duty_now;     /* текущая скважность [-1..1] */
+    float              duty_target;  /* целевая скважность [-1..1] */
+    PID_t              pid;          /* регулятор плавности        */
 } Motor_t;
 
-void motor_init(Motor_t *m, Encoder_t *enc, float dt);
-void motor_velocity_update(Motor_t *m, float target_mps, float dt);
-void motor_set_duty(Motor_t *m, float duty);
-void motor_stop(Motor_t *m);
+void motor_init      (Motor_t *m, float dt);
+void motor_set_target(Motor_t *m, float duty);
+void motor_update    (Motor_t *m, float dt);
+void motor_stop      (Motor_t *m);
