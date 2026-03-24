@@ -1,7 +1,6 @@
 #include "motors.h"
 #include "robot_config.h"
 
-/* Применяет скважность напрямую к CCR (без PID) */
 static void motor_apply_duty(Motor_t *m, float duty)
 {
     if      (duty >  1.0f) duty =  1.0f;
@@ -29,12 +28,9 @@ void motor_init(Motor_t *m, float dt)
     m->duty_now    = 0.0f;
     m->duty_target = 0.0f;
 
-    HAL_TIM_PWM_Start(m->htim, m->ch_fwd);
-    HAL_TIM_PWM_Start(m->htim, m->ch_rev);
-
-    /* EN-пины HIGH — разрешить драйвер */
-    HAL_GPIO_WritePin(m->en_port, m->en_r_pin | m->en_l_pin, GPIO_PIN_SET);
-
+    /* Каналы запускаются снаружи (в MX_TIM*_Init) до вызова motor_init,
+     * чтобы избежать конфликтов HAL-блокировки при нескольких
+     * motor_init на одном и том же htim. */
     motor_apply_duty(m, 0.0f);
 }
 
